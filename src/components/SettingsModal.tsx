@@ -7,7 +7,6 @@ import {
   Monitor,
   ShieldCheck,
   Download,
-  Trash2,
   Check,
 } from 'lucide-react';
 import { UserProfile, Language, SkillLevel, AppName } from '../types';
@@ -56,11 +55,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  const handleDeleteAccount = () => {
-    if (confirm('Are you sure you want to reset and clear all local project data?')) {
-      localStorage.clear();
-      window.location.reload();
+  const handleSignOut = async () => {
+    const { error } = await (await import('../lib/supabase')).requireSupabase().auth.signOut();
+    if (error) {
+      alert(error.message);
+      return;
     }
+    window.location.reload();
   };
 
   const [activeTab, setActiveTab] = useState<'preferences' | 'brandKit'>('preferences');
@@ -300,7 +301,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* Privacy & Account Actions */}
           <div className="pt-3 border-t border-slate-800 space-y-2">
             <span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] block">
-              Privacy & Local Storage Actions:
+              Privacy & Account Actions:
             </span>
             <div className="flex gap-2">
               <button
@@ -313,12 +314,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </button>
               <button
                 type="button"
-                onClick={handleDeleteAccount}
+                onClick={handleSignOut}
                 className="py-2 px-3 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 font-semibold flex items-center gap-1.5 transition"
-                title="Reset local data"
+                title="Sign out of this account"
               >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Reset</span>
+                
+                <span>Sign Out</span>
               </button>
             </div>
           </div>
