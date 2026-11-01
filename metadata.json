@@ -1,0 +1,6 @@
+{
+  "name": "AI Design Tutor & Creator",
+  "description": "Guided design-learning and creation platform for Photoshop and Photopea in English, Roman Urdu, and Urdu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
