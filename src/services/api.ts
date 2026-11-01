@@ -1138,8 +1138,6 @@ class ApiGateway {
   async runIntake(projectId: string, ideaText: string): Promise<ProjectBrief> {
     const project = await this.getProject(projectId);
     if (!project) throw new Error('Project not found');
-    await this.spendCredits(1, 'ai-intake: Idea to Structured Brief');
-
     const cleanIdea = ideaText.trim();
     // Try server AI intake if available
     let dynamicData: any = null;
@@ -1147,14 +1145,23 @@ class ApiGateway {
       const res = await fetch('/api/ai/intake', {
         method: 'POST',
         headers: await this.authHeaders(),
-        body: JSON.stringify({ ideaText: cleanIdea }),
+        body: JSON.stringify({
+          ideaText: cleanIdea,
+          projectId,
+          idempotencyKey: `intake:${projectId}:${crypto.randomUUID()}`,
+        }),
       });
+      if (res.status === 402) {
+        const paymentError = await res.json();
+        throw new Error(paymentError.error || 'Insufficient credits.');
+      }
       if (res.ok) {
         const json = await res.json();
         dynamicData = json.data;
       }
-    } catch {
-      // offline fallback
+    } catch (error) {
+      if (error instanceof Error && /credit/i.test(error.message)) throw error;
+      // Local non-AI brief construction remains available if the AI service is offline.
     }
 
     const brief: ProjectBrief = {
