@@ -1497,6 +1497,63 @@ class ApiGateway {
     return qa;
   }
 
+  private async persistMentorExchange(
+    message: string,
+    reply: string,
+    projectContext: any,
+    currentStep: any,
+    language: Language,
+    result: { modelUsed: string; highThinkingEnabled: boolean }
+  ): Promise<void> {
+    try {
+      const db = requireSupabase() as any;
+      const userId = await this.userId();
+      const rawProjectId = projectContext?.id;
+      const projectId = typeof rawProjectId === 'string' && this.isUuid(rawProjectId) ? rawProjectId : null;
+      let conversationQuery = db.from('mentor_conversations').select('id').eq('user_id', userId);
+      conversationQuery = projectId
+        ? conversationQuery.eq('project_id', projectId)
+        : conversationQuery.is('project_id', null);
+      const existing = this.check(await conversationQuery.order('updated_at', { ascending: false }).limit(1).maybeSingle());
+      let conversationId = existing?.id;
+      if (!conversationId) {
+        const created = this.check(await db.from('mentor_conversations').insert({
+          user_id: userId,
+          project_id: projectId,
+          title: message.trim().slice(0, 90) || 'AI Design Tutor conversation',
+          language,
+        }).select('id').single());
+        conversationId = created.id;
+      } else {
+        this.check(await db.from('mentor_conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId));
+      }
+      this.check(await db.from('mentor_messages').insert([
+        {
+          conversation_id: conversationId,
+          user_id: userId,
+          speaker: 'user',
+          content: message,
+          language,
+          current_step_id: currentStep?.id || null,
+          high_thinking: result.highThinkingEnabled,
+        },
+        {
+          conversation_id: conversationId,
+          user_id: userId,
+          speaker: 'assistant',
+          content: reply,
+          language,
+          current_step_id: currentStep?.id || null,
+          model_name: result.modelUsed,
+          high_thinking: result.highThinkingEnabled,
+        },
+      ]));
+    } catch (error) {
+      // The tutor answer should still reach the user if history persistence fails.
+      console.warn('Could not save AI mentor history:', error);
+    }
+  }
+
   // AI Mentor Chat (calls server /api/ai/mentor with high thinking option)
   async askMentor(
     message: string,
@@ -1518,7 +1575,9 @@ class ApiGateway {
         }),
       });
       if (res.ok) {
-        return await res.json();
+        const result = await res.json();
+        await this.persistMentorExchange(message, result.reply, projectContext, currentStep, language, result);
+        return result;
       }
     } catch (e) {
       console.warn('Network call to /api/ai/mentor failed:', e);
@@ -1537,21 +1596,54 @@ class ApiGateway {
         : `Focus on the objective for "${currentStep?.title || 'this step'}". Ensure layer order and contrast are preserved.`;
     }
 
-    return {
+    const result = {
       reply,
       modelUsed: 'local-fallback',
       highThinkingEnabled: enableHighThinking,
     };
+    await this.persistMentorExchange(message, result.reply, projectContext, currentStep, language, result);
+    return result;
   }
 
-  // Reference Analyzer
+  // Reference Analyzer examples are read from the published Supabase catalogue.
   async getReferenceAnalysis(): Promise<ReferenceAnalysis> {
-    return SEED_REFERENCE_ANALYSIS;
+    const db = requireSupabase() as any;
+    const row = this.check(await db.from('reference_analyses')
+      .select('id,client_id,title,category,image_url,analysis')
+      .eq('is_public', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle());
+    if (!row) return SEED_REFERENCE_ANALYSIS;
+    return {
+      ...SEED_REFERENCE_ANALYSIS,
+      ...(row.analysis || {}),
+      id: row.client_id || row.id,
+      title: row.title,
+      category: row.category,
+      imageUrl: row.image_url || row.analysis?.imageUrl || SEED_REFERENCE_ANALYSIS.imageUrl,
+    } as ReferenceAnalysis;
   }
 
-  // Practice Mode
+  // Published practice assignments are maintained in Supabase.
   async getPracticeAssignments(): Promise<PracticeAssignment[]> {
-    return SEED_PRACTICE_ASSIGNMENTS;
+    const db = requireSupabase() as any;
+    const rows = this.check(await db.from('practice_assignments')
+      .select('id,title,category,difficulty,time_estimate,objective,scenario,rubric,hint_ladder')
+      .eq('is_published', true)
+      .order('created_at', { ascending: true })) || [];
+    if (!rows.length) return SEED_PRACTICE_ASSIGNMENTS;
+    return rows.map((row: any) => ({
+      id: row.id,
+      title: row.title,
+      category: row.category,
+      difficulty: row.difficulty,
+      timeEstimate: row.time_estimate || '',
+      objective: row.objective,
+      scenario: row.scenario,
+      rubric: row.rubric || [],
+      hintLadder: row.hint_ladder || [],
+    })) as PracticeAssignment[];
   }
 }
 
