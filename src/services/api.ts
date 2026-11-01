@@ -16,6 +16,7 @@ import { checkAspectRatio } from '../tools/aspect';
 import { calculateContrastRatio, evaluateWcagCompliance } from '../tools/contrast';
 import { checkSafeMargins } from '../tools/margins';
 import { evaluateDesignPaletteHarmony } from '../tools/palette';
+import { requireSupabase } from '../lib/supabase';
 
 const STORAGE_KEYS = {
   PROFILE: 'ai_design_tutor_profile_v1',
@@ -746,144 +747,398 @@ export const SEED_PRACTICE_ASSIGNMENTS: PracticeAssignment[] = [
   },
 ];
 
-// In-memory or localStorage DB
+// Authenticated Supabase persistence. Demo seed content is read-only and is never
+// written to a real user's account.
 class ApiGateway {
-  private getStorage<T>(key: string, defaultValue: T): T {
-    try {
-      const data = localStorage.getItem(key);
-      return data ? JSON.parse(data) : defaultValue;
-    } catch {
-      return defaultValue;
-    }
+  private isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
   }
 
-  private setStorage<T>(key: string, value: T): void {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      console.warn('Storage set failed:', e);
-    }
+  private async userId(): Promise<string> {
+    const db = requireSupabase() as any;
+    const { data, error } = await db.auth.getUser();
+    if (error || !data?.user?.id) throw new Error('Please sign in to continue.');
+    return data.user.id as string;
   }
 
-  // User Profile
-  async getProfile(): Promise<UserProfile> {
-    return this.getStorage<UserProfile>(STORAGE_KEYS.PROFILE, {
-      id: 'user-001',
-      displayName: 'Opal Frank',
-      role: 'user',
-      language: 'ur-roman',
-      skillLevel: 'beginner',
-      appName: 'photoshop',
-      appVersion: 'Photoshop 2024 / Photopea',
+  private check(result: any): any {
+    if (result?.error) throw result.error;
+    return result?.data;
+  }
+
+  private async authHeaders(): Promise<HeadersInit> {
+    const db = requireSupabase() as any;
+    const { data, error } = await db.auth.getSession();
+    if (error || !data?.session?.access_token) throw new Error('Please sign in to continue.');
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${data.session.access_token}`,
+    };
+  }
+
+  private async hydrateProjects(rows: any[]): Promise<Project[]> {
+    if (!rows.length) return [];
+    const db = requireSupabase() as any;
+    const ids = rows.map((row) => row.id);
+    const fetchRelated = async (table: string) => {
+      const result = await db.from(table).select('*').in('project_id', ids);
+      return this.check(result) || [];
+    };
+    const [briefRows, conceptRows, blueprintRows, stepRows, verificationRows, qaRows] =
+      await Promise.all([
+        fetchRelated('project_briefs'),
+        fetchRelated('project_concepts'),
+        fetchRelated('project_blueprints'),
+        fetchRelated('lesson_steps'),
+        fetchRelated('step_verifications'),
+        fetchRelated('qa_reviews'),
+      ]);
+
+    const byProject = (items: any[]) => {
+      const map = new Map<string, any[]>();
+      for (const item of items) {
+        const list = map.get(item.project_id) || [];
+        list.push(item);
+        map.set(item.project_id, list);
+      }
+      return map;
+    };
+    const briefs = new Map(briefRows.map((item: any) => [item.project_id, item]));
+    const blueprints = new Map(blueprintRows.map((item: any) => [item.project_id, item]));
+    const concepts = byProject(conceptRows);
+    const steps = byProject(stepRows);
+    const verifications = byProject(verificationRows);
+    const reviews = byProject(qaRows);
+
+    return rows.map((row: any) => {
+      const briefRow: any = briefs.get(row.id);
+      const blueprintRow: any = blueprints.get(row.id);
+      const projectSteps = (steps.get(row.id) || [])
+        .sort((a, b) => a.position - b.position)
+        .map((item: any) => ({ ...(item.payload || {}), id: item.client_step_id, position: item.position, status: item.status }));
+      const verificationMap: Record<string, VerificationResult> = {};
+      for (const item of verifications.get(row.id) || []) {
+        const payload = item.payload || {};
+        const result = { ...payload, id: item.client_verification_id || payload.id, stepId: payload.stepId || item.client_verification_id };
+        if (result.stepId) verificationMap[result.stepId] = result as VerificationResult;
+      }
+      const latestReview = (reviews.get(row.id) || []).sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      )[0];
+      const approvedConcept = (concepts.get(row.id) || []).find((item: any) => item.approved);
+      return {
+        id: row.id,
+        title: row.title,
+        category: row.category,
+        mode: row.mode,
+        status: row.status,
+        appName: row.app_name,
+        currentStepId: row.current_step_id || '',
+        ideaText: row.idea_text,
+        brief: briefRow ? {
+          facts: briefRow.facts,
+          interpreted: briefRow.interpreted,
+          assumptions: briefRow.assumptions,
+          placeholders: briefRow.placeholders,
+          missingRequiredFacts: briefRow.missing_required_facts,
+          optionalPreferences: briefRow.optional_preferences,
+          deliverables: briefRow.deliverables,
+          approved: briefRow.approved,
+          version: briefRow.version,
+        } : undefined,
+        concepts: (concepts.get(row.id) || []).map((item: any) => ({
+          ...(item.payload || {}),
+          id: item.client_id,
+          title: item.title,
+          mood: item.mood || item.payload?.mood || '',
+          approved: item.approved,
+          revisionNote: item.revision_note || item.payload?.revisionNote,
+        })),
+        approvedConceptId: row.approved_concept_client_id || approvedConcept?.client_id || undefined,
+        blueprint: blueprintRow?.payload || undefined,
+        steps: projectSteps,
+        verifications: verificationMap,
+        qaReview: latestReview ? {
+          id: latestReview.id,
+          projectId: row.id,
+          summary: latestReview.summary,
+          topFixes: latestReview.top_fixes,
+          findings: latestReview.findings,
+          createdAt: latestReview.created_at,
+        } : undefined,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      } as Project;
     });
+  }
+
+  private async persistProject(project: Project): Promise<Project> {
+    if (!this.isUuid(project.id)) return project; // sample/demo projects are read-only
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    const updatedAt = new Date().toISOString();
+    project.updatedAt = updatedAt;
+
+    this.check(await db.from('projects').upsert({
+      id: project.id,
+      user_id: userId,
+      title: project.title,
+      category: project.category || 'poster',
+      mode: project.mode,
+      status: project.status,
+      app_name: project.appName,
+      current_step_id: project.currentStepId || null,
+      approved_concept_client_id: project.approvedConceptId || null,
+      idea_text: project.ideaText,
+      metadata: {},
+      created_at: project.createdAt,
+      updated_at: updatedAt,
+    }));
+
+    if (project.brief) {
+      const brief = project.brief;
+      this.check(await db.from('project_briefs').upsert({
+        project_id: project.id,
+        facts: brief.facts,
+        interpreted: brief.interpreted,
+        assumptions: brief.assumptions,
+        placeholders: brief.placeholders,
+        missing_required_facts: brief.missingRequiredFacts,
+        optional_preferences: brief.optionalPreferences,
+        deliverables: brief.deliverables,
+        approved: brief.approved,
+        version: brief.version,
+      }, { onConflict: 'project_id' }));
+    } else {
+      this.check(await db.from('project_briefs').delete().eq('project_id', project.id));
+    }
+
+    this.check(await db.from('project_concepts').delete().eq('project_id', project.id));
+    if (project.concepts?.length) {
+      this.check(await db.from('project_concepts').insert(project.concepts.map((concept) => ({
+        project_id: project.id,
+        client_id: concept.id,
+        title: concept.title,
+        mood: concept.mood || null,
+        approved: Boolean(concept.approved),
+        revision_note: concept.revisionNote || null,
+        payload: concept,
+      }))));
+    }
+
+    if (project.blueprint) {
+      this.check(await db.from('project_blueprints').upsert({
+        project_id: project.id,
+        client_id: project.blueprint.id,
+        payload: project.blueprint,
+      }, { onConflict: 'project_id' }));
+    } else {
+      this.check(await db.from('project_blueprints').delete().eq('project_id', project.id));
+    }
+
+    if (project.steps?.length) {
+      this.check(await db.from('lesson_steps').upsert(project.steps.map((step) => ({
+        project_id: project.id,
+        client_step_id: step.id,
+        position: step.position,
+        title: step.title,
+        title_urdu: step.titleUrdu || null,
+        objective: step.objective || null,
+        tool_name: step.toolName || null,
+        status: step.status,
+        payload: step,
+      })), { onConflict: 'project_id,client_step_id' }));
+    }
+
+    this.check(await db.from('step_verifications').delete().eq('project_id', project.id));
+    if (Object.keys(project.verifications || {}).length) {
+      const { data: savedSteps, error: stepsError } = await db
+        .from('lesson_steps').select('id,client_step_id').eq('project_id', project.id);
+      if (stepsError) throw stepsError;
+      const stepIds = new Map((savedSteps || []).map((step: any) => [step.client_step_id, step.id]));
+      this.check(await db.from('step_verifications').insert(
+        Object.values(project.verifications).map((verification) => ({
+          project_id: project.id,
+          lesson_step_id: stepIds.get(verification.stepId) || null,
+          client_verification_id: verification.id,
+          method: verification.method,
+          passed: (verification.failed || []).length === 0,
+          needs_new_submission: verification.needsNewSubmission,
+          payload: verification,
+          verified_at: verification.timestamp,
+        }))
+      ));
+    }
+
+    this.check(await db.from('qa_reviews').delete().eq('project_id', project.id));
+    if (project.qaReview) {
+      this.check(await db.from('qa_reviews').insert({
+        project_id: project.id,
+        summary: project.qaReview.summary,
+        top_fixes: project.qaReview.topFixes,
+        findings: project.qaReview.findings,
+        created_at: project.qaReview.createdAt,
+      }));
+    }
+    return project;
+  }
+
+  // User profile and optional brand kit
+  async getProfile(): Promise<UserProfile> {
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    const { data: authData } = await db.auth.getUser();
+    const profileResult = await db.from('profiles').select('*').eq('id', userId).maybeSingle();
+    const profile = this.check(profileResult);
+    const brandResult = await db.from('brand_kits').select('*').eq('user_id', userId).eq('is_default', true).maybeSingle();
+    const brand = this.check(brandResult);
+    return {
+      id: userId,
+      displayName: profile?.display_name || authData?.user?.email?.split('@')[0] || 'Designer',
+      role: profile?.role || 'user',
+      language: profile?.language || 'ur-roman',
+      skillLevel: profile?.skill_level || 'beginner',
+      appName: profile?.app_name || 'photoshop',
+      appVersion: profile?.app_version || 'Photoshop / Photopea',
+      brandKit: brand ? {
+        id: brand.id,
+        name: brand.name,
+        colors: brand.colors || [],
+        primaryFont: brand.primary_font || '',
+        secondaryFont: brand.secondary_font || '',
+        tagline: brand.tagline || '',
+        contactNumber: brand.contact_number || '',
+        address: brand.address || '',
+        rules: brand.rules || [],
+      } : undefined,
+    };
   }
 
   async updateProfile(updates: Partial<UserProfile>): Promise<UserProfile> {
-    const current = await this.getProfile();
-    const updated = { ...current, ...updates };
-    this.setStorage(STORAGE_KEYS.PROFILE, updated);
-    return updated;
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    const profileUpdate: Record<string, any> = {};
+    if (updates.displayName !== undefined) profileUpdate.display_name = updates.displayName;
+    if (updates.language !== undefined) profileUpdate.language = updates.language;
+    if (updates.skillLevel !== undefined) profileUpdate.skill_level = updates.skillLevel;
+    if (updates.appName !== undefined) profileUpdate.app_name = updates.appName;
+    if (updates.appVersion !== undefined) profileUpdate.app_version = updates.appVersion;
+    if (Object.keys(profileUpdate).length) {
+      this.check(await db.from('profiles').update(profileUpdate).eq('id', userId));
+    }
+
+    if (updates.brandKit) {
+      const brand = updates.brandKit;
+      const existing = this.check(await db.from('brand_kits').select('id').eq('user_id', userId).eq('is_default', true).maybeSingle());
+      const values = {
+        user_id: userId,
+        name: brand.name,
+        colors: brand.colors,
+        primary_font: brand.primaryFont,
+        secondary_font: brand.secondaryFont,
+        tagline: brand.tagline,
+        contact_number: brand.contactNumber,
+        address: brand.address,
+        rules: brand.rules,
+        is_default: true,
+      };
+      const write = existing
+        ? await db.from('brand_kits').update(values).eq('id', existing.id)
+        : await db.from('brand_kits').insert(values);
+      this.check(write);
+    }
+    return this.getProfile();
   }
 
-  // Credits
+  // Credits are maintained only by PostgreSQL RPCs and the Auth signup trigger.
   async getCredits(): Promise<{ balance: number; history: CreditTransaction[] }> {
-    return this.getStorage(STORAGE_KEYS.CREDITS, {
-      balance: 44, // 50 initial signup - 6 spent on seed poster
-      history: [
-        { id: 'tx-1', delta: 50, reason: 'Signup Welcome Bonus', createdAt: new Date(Date.now() - 86400000).toISOString() },
-        { id: 'tx-2', delta: -1, reason: 'ai-intake: Karachi Biryani Brief', createdAt: new Date(Date.now() - 3600000 * 3).toISOString() },
-        { id: 'tx-3', delta: -2, reason: 'ai-concepts: 2 Design Directions', createdAt: new Date(Date.now() - 3600000 * 2.5).toISOString() },
-        { id: 'tx-4', delta: -3, reason: 'ai-blueprint & 12-Step Tutor Generation', createdAt: new Date(Date.now() - 3600000 * 2).toISOString() },
-      ],
-    });
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    const [accountResult, ledgerResult] = await Promise.all([
+      db.from('credit_accounts').select('balance').eq('user_id', userId).maybeSingle(),
+      db.from('credit_ledger').select('id,delta,reason,created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(100),
+    ]);
+    const account = this.check(accountResult);
+    const ledger = this.check(ledgerResult) || [];
+    return {
+      balance: account?.balance ?? 0,
+      history: ledger.map((item: any) => ({
+        id: item.id,
+        delta: item.delta,
+        reason: item.reason,
+        createdAt: item.created_at,
+      })),
+    };
   }
 
   async spendCredits(amount: number, reason: string): Promise<number> {
-    const data = await this.getCredits();
-    if (data.balance < amount) {
-      throw new Error('Aap ke paas kafi credits nahi hain (Insufficient credits).');
-    }
-    const newBal = data.balance - amount;
-    data.balance = newBal;
-    data.history.unshift({
-      id: 'tx-' + Date.now(),
-      delta: -amount,
-      reason,
-      createdAt: new Date().toISOString(),
+    const db = requireSupabase() as any;
+    const { data, error } = await db.rpc('spend_credits', {
+      p_amount: amount,
+      p_reason: reason,
+      p_idempotency_key: `web:${crypto.randomUUID()}`,
+      p_reference_type: 'ai_operation',
+      p_reference_id: null,
     });
-    this.setStorage(STORAGE_KEYS.CREDITS, data);
-    return newBal;
+    if (error) throw error;
+    return Number(data);
   }
 
-  async refundCredits(amount: number, reason: string): Promise<number> {
-    const data = await this.getCredits();
-    data.balance += amount;
-    data.history.unshift({
-      id: 'tx-' + Date.now(),
-      delta: amount,
-      reason: `Refund: ${reason}`,
-      createdAt: new Date().toISOString(),
-    });
-    this.setStorage(STORAGE_KEYS.CREDITS, data);
-    return data.balance;
+  async refundCredits(_amount: number, _reason: string): Promise<number> {
+    throw new Error('Credit refunds can only be issued by the trusted backend.');
   }
 
-  // Projects
+  // User-owned design projects
   async getProjects(): Promise<Project[]> {
-    return this.getStorage<Project[]>(STORAGE_KEYS.PROJECTS, [SEED_PROJECT]);
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    const { data, error } = await db.from('projects').select('*').eq('user_id', userId).order('updated_at', { ascending: false });
+    if (error) throw error;
+    return this.hydrateProjects(data || []);
   }
 
   async getProject(id: string): Promise<Project | null> {
+    if (id === SEED_PROJECT.id) return SEED_PROJECT;
     const projects = await this.getProjects();
-    return projects.find((p) => p.id === id) || null;
+    return projects.find((project) => project.id === id) || null;
   }
 
   async createProject(ideaText: string, mode: Project['mode'] = 'idea_to_final'): Promise<Project> {
-    const projects = await this.getProjects();
-    const newId = 'proj-' + Date.now();
+    const now = new Date().toISOString();
     const project: Project = {
-      id: newId,
-      title: ideaText.slice(0, 40) + '...',
+      id: crypto.randomUUID(),
+      title: ideaText.trim().slice(0, 40) || 'Untitled Design Project',
       category: 'poster',
       mode,
       status: 'draft',
       appName: 'photoshop',
       currentStepId: 'step-1',
-      ideaText,
+      ideaText: ideaText.trim(),
       steps: [],
       verifications: {},
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
-    projects.unshift(project);
-    this.setStorage(STORAGE_KEYS.PROJECTS, projects);
-    return project;
+    return this.persistProject(project);
   }
 
   async updateProject(project: Project): Promise<Project> {
-    const projects = await this.getProjects();
-    const idx = projects.findIndex((p) => p.id === project.id);
-    project.updatedAt = new Date().toISOString();
-    if (idx >= 0) {
-      projects[idx] = project;
-    } else {
-      projects.unshift(project);
-    }
-    this.setStorage(STORAGE_KEYS.PROJECTS, projects);
-    return project;
+    if (project.id === SEED_PROJECT.id) return project;
+    return this.persistProject(project);
   }
 
   async deleteProject(id: string): Promise<void> {
-    const projects = await this.getProjects();
-    const filtered = projects.filter((p) => p.id !== id);
-    this.setStorage(STORAGE_KEYS.PROJECTS, filtered);
+    if (!this.isUuid(id)) return;
+    const db = requireSupabase() as any;
+    const userId = await this.userId();
+    this.check(await db.from('projects').delete().eq('id', id).eq('user_id', userId));
   }
 
   // AI Intake
   async runIntake(projectId: string, ideaText: string): Promise<ProjectBrief> {
-    await this.spendCredits(1, 'ai-intake: Idea to Structured Brief');
     const project = await this.getProject(projectId);
     if (!project) throw new Error('Project not found');
+    await this.spendCredits(1, 'ai-intake: Idea to Structured Brief');
 
     const cleanIdea = ideaText.trim();
     // Try server AI intake if available
@@ -891,7 +1146,7 @@ class ApiGateway {
     try {
       const res = await fetch('/api/ai/intake', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await this.authHeaders(),
         body: JSON.stringify({ ideaText: cleanIdea }),
       });
       if (res.ok) {
@@ -1253,7 +1508,7 @@ class ApiGateway {
     try {
       const res = await fetch('/api/ai/mentor', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await this.authHeaders(),
         body: JSON.stringify({
           message,
           projectContext,
