@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ShieldCheck,
   Cpu,
@@ -10,86 +10,71 @@ import {
   Layers,
 } from 'lucide-react';
 import { Language } from '../types';
+import { requireSupabase } from '../lib/supabase';
 
 interface AdminViewProps {
   language: Language;
 }
 
 export const AdminView: React.FC<AdminViewProps> = () => {
-  const modelRuns = [
-    {
-      id: 1,
-      fn: 'ai-intake',
-      model: 'gemini-3.8-flash',
-      inputTokens: 412,
-      outputTokens: 380,
-      thinking: 'low',
-      latencyMs: 620,
-      estCost: '$0.0017',
-      status: 'ok',
-      time: '10 mins ago',
-    },
-    {
-      id: 2,
-      fn: 'ai-concepts',
-      model: 'gemini-3.8-flash',
-      inputTokens: 940,
-      outputTokens: 710,
-      thinking: 'medium',
-      latencyMs: 1140,
-      estCost: '$0.0033',
-      status: 'ok',
-      time: '9 mins ago',
-    },
-    {
-      id: 3,
-      fn: 'ai-blueprint',
-      model: 'gemini-3.8-flash',
-      inputTokens: 1120,
-      outputTokens: 840,
-      thinking: 'medium',
-      latencyMs: 1420,
-      estCost: '$0.0039',
-      status: 'ok',
-      time: '7 mins ago',
-    },
-    {
-      id: 4,
-      fn: 'ai-mentor',
-      model: 'gemini-4-argon',
-      inputTokens: 680,
-      outputTokens: 520,
-      thinking: 'HIGH (Reasoning)',
-      latencyMs: 1890,
-      estCost: '$0.0042',
-      status: 'ok',
-      time: '2 mins ago',
-    },
-  ];
+  const [modelRuns, setModelRuns] = useState<any[]>([]);
+  const [knowledgeChunks, setKnowledgeChunks] = useState<any[]>([]);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
-  const knowledgeChunks = [
-    {
-      id: 'chunk-canvas-01',
-      topic: 'Canvas & Rulers',
-      app: 'photoshop-2024 / photopea',
-      content: 'Ctrl+N opens New Document. Resolution must be 300 DPI for print. Ctrl+R enables rulers.',
-      reviewer: 'Lead Educator (Verified)',
-    },
-    {
-      id: 'chunk-mask-07',
-      topic: 'Non-destructive Layer Masking',
-      app: 'photoshop / photopea',
-      content: 'Never use eraser (E) on subject layers. Always add Layer Mask; black hides, white reveals.',
-      reviewer: 'Senior Retoucher (Verified)',
-    },
-    {
-      id: 'chunk-shadow-09',
-      topic: 'Ambient Occlusion Shadows',
-      app: 'photoshop / photopea',
-      content: 'Ground food with soft brush in Multiply mode. Dark burgundy #1A0808 rather than pure black #000000.',
-      reviewer: 'Art Director (Verified)',
-    },
-  ];
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const db = requireSupabase() as any;
+        const { data: authData, error: authError } = await db.auth.getUser();
+        if (authError || !authData?.user) throw authError || new Error('Please sign in.');
+        const { data: profile, error: profileError } = await db
+          .from('profiles').select('role').eq('id', authData.user.id).single();
+        if (profileError) throw profileError;
+        if (profile?.role !== 'admin') {
+          if (active) setIsAdmin(false);
+          return;
+        }
+        const [runs, chunks] = await Promise.all([
+          db.from('model_runs').select('id,function_name,model_name,input_tokens,output_tokens,thinking_level,latency_ms,estimated_cost_usd,status,created_at').order('created_at', { ascending: false }).limit(50),
+          db.from('knowledge_chunks').select('id,topic,app_versions,content,reviewer').eq('review_status', 'approved').order('topic'),
+        ]);
+        if (runs.error) throw runs.error;
+        if (chunks.error) throw chunks.error;
+        if (active) {
+          setIsAdmin(true);
+          setModelRuns(runs.data || []);
+          setKnowledgeChunks(chunks.data || []);
+        }
+      } catch (e) {
+        if (active) setLoadError(e instanceof Error ? e.message : 'Unable to load admin data.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    load();
+    return () => { active = false; };
+  }, []);
+
+  const totalCost = useMemo(
+    () => modelRuns.reduce((sum, run) => sum + Number(run.estimated_cost_usd || 0), 0),
+    [modelRuns]
+  );
+  const averageLatency = useMemo(() => {
+    const values = modelRuns.map((run) => Number(run.latency_ms)).filter(Number.isFinite);
+    return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0;
+  }, [modelRuns]);
+  const activeModels = useMemo(
+    () => [...new Set(modelRuns.map((run) => run.model_name).filter(Boolean))],
+    [modelRuns]
+  );
+
+
+  if (loading) return <div className="max-w-6xl mx-auto p-8 text-slate-300">Loading admin data…</div>;
+  if (loadError) return <div className="max-w-6xl mx-auto rounded-2xl border border-rose-500/30 bg-rose-500/10 p-6 text-rose-200">{loadError}</div>;
+  if (!isAdmin) return <div className="max-w-3xl mx-auto rounded-2xl border border-slate-800 bg-slate-900 p-6 text-slate-300"><h2 className="font-bold text-white">Admin access required</h2><p className="mt-2 text-sm">Your signed-in account does not have the admin role. Ask an administrator to grant access.</p></div>;
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
@@ -104,7 +89,7 @@ export const AdminView: React.FC<AdminViewProps> = () => {
           </h1>
         </div>
         <p className="text-sm text-slate-400 max-w-2xl">
-          Track token usage, estimated costs ($0.75 in / $3.75 out per 1M tokens), and verified knowledge chunks.
+          Live usage logs and reviewed knowledge content stored in Supabase.
         </p>
       </div>
 
@@ -115,8 +100,8 @@ export const AdminView: React.FC<AdminViewProps> = () => {
             <DollarSign className="w-4 h-4 text-emerald-400" />
             Estimated Project Cost
           </span>
-          <div className="text-2xl font-black text-white font-mono">$0.34</div>
-          <p className="text-[10px] text-slate-500">Within the target $0.50 budget</p>
+          <div className="text-2xl font-black text-white font-mono">${totalCost.toFixed(4)}</div>
+          <p className="text-[10px] text-slate-500">{modelRuns.length} recorded AI runs</p>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
@@ -124,8 +109,8 @@ export const AdminView: React.FC<AdminViewProps> = () => {
             <Cpu className="w-4 h-4 text-sky-400" />
             Active Models
           </span>
-          <div className="text-sm font-bold text-slate-200">gemini-3.8-flash</div>
-          <p className="text-[10px] text-purple-400 font-mono">High Thinking: gemini-4-argon</p>
+          <div className="text-sm font-bold text-slate-200">{activeModels.length ? activeModels.join(", ") : "No recorded runs"}</div>
+          <p className="text-[10px] text-purple-400 font-mono">From actual model_runs records</p>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
@@ -133,8 +118,8 @@ export const AdminView: React.FC<AdminViewProps> = () => {
             <Activity className="w-4 h-4 text-amber-400" />
             Average Latency
           </span>
-          <div className="text-2xl font-black text-amber-400 font-mono">1.2s</div>
-          <p className="text-[10px] text-slate-500">Fast streaming SSE pipeline</p>
+          <div className="text-2xl font-black text-amber-400 font-mono">{averageLatency}ms</div>
+          <p className="text-[10px] text-slate-500">Average recorded latency</p>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
@@ -142,8 +127,8 @@ export const AdminView: React.FC<AdminViewProps> = () => {
             <Database className="w-4 h-4 text-purple-400" />
             Reviewed Chunks
           </span>
-          <div className="text-2xl font-black text-purple-300 font-mono">28</div>
-          <p className="text-[10px] text-slate-500">Photoshop & Photopea verified</p>
+          <div className="text-2xl font-black text-purple-300 font-mono">{knowledgeChunks.length}</div>
+          <p className="text-[10px] text-slate-500">Approved knowledge chunks</p>
         </div>
       </div>
 
@@ -169,23 +154,24 @@ export const AdminView: React.FC<AdminViewProps> = () => {
             <tbody className="divide-y divide-slate-800/60 font-mono">
               {modelRuns.map((run) => (
                 <tr key={run.id} className="text-slate-300">
-                  <td className="py-2.5 font-bold text-amber-300">{run.fn}</td>
-                  <td className="py-2.5 text-slate-400">{run.model}</td>
+                  <td className="py-2.5 font-bold text-amber-300">{run.function_name}</td>
+                  <td className="py-2.5 text-slate-400">{run.model_name}</td>
                   <td className="py-2.5">
-                    {run.inputTokens} / {run.outputTokens}
+                    {run.input_tokens} / {run.output_tokens}
                   </td>
                   <td className="py-2.5">
                     <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[10px]">
-                      {run.thinking}
+                      {run.thinking_level || 'standard'}
                     </span>
                   </td>
-                  <td className="py-2.5 text-slate-400">{run.latencyMs}ms</td>
-                  <td className="py-2.5 font-bold text-emerald-400">{run.estCost}</td>
+                  <td className="py-2.5 text-slate-400">{run.latency_ms}ms</td>
+                  <td className="py-2.5 font-bold text-emerald-400">{`${Number(run.estimated_cost_usd || 0).toFixed(4)}`}</td>
                   <td className="py-2.5">
-                    <span className="text-emerald-400 font-sans font-bold">✓ {run.status}</span>
+                    <span className="text-emerald-400 font-sans font-bold">{run.status}</span>
                   </td>
                 </tr>
               ))}
+              {!modelRuns.length && <tr><td colSpan={7} className="py-6 text-center text-slate-500">No model runs have been recorded yet.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -205,8 +191,9 @@ export const AdminView: React.FC<AdminViewProps> = () => {
                 <span className="text-[10px] font-mono text-slate-500">{c.id}</span>
               </div>
               <p className="text-slate-300 text-[11px] leading-relaxed">{c.content}</p>
+              <p className="text-[10px] text-slate-500">{(c.app_versions || []).join(' / ')}</p>
               <div className="pt-2 border-t border-slate-900 text-[10px] text-emerald-400 font-semibold">
-                ✓ {c.reviewer}
+                {c.reviewer || 'Reviewed'}
               </div>
             </div>
           ))}
