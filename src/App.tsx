@@ -16,13 +16,14 @@ import { SettingsModal } from './components/SettingsModal';
 import { LandingView } from './components/LandingView';
 import { Project, Language, ProjectMode } from './types';
 import { api, SEED_PROJECT } from './services/api';
+import { AuthGate } from './components/AuthGate';
 
-export default function App() {
+function WorkspaceApp() {
   const [currentView, setCurrentView] = useState<string>('dashboard');
   const [language, setLanguage] = useState<Language>('ur-roman');
-  const [projects, setProjects] = useState<Project[]>([SEED_PROJECT]);
-  const [activeProjectId, setActiveProjectId] = useState<string>(SEED_PROJECT.id);
-  const [credits, setCredits] = useState<number>(44);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string>('');
+  const [credits, setCredits] = useState<number>(0);
 
   // Modals
   const [showNewModal, setShowNewModal] = useState(false);
@@ -58,8 +59,11 @@ export default function App() {
 
   const handleOpenProject = (id: string) => {
     setActiveProjectId(id);
-    const proj = projects.find((p) => p.id === id);
+    const proj = projects.find((p) => p.id === id) || (id === SEED_PROJECT.id ? SEED_PROJECT : null);
     if (!proj) return;
+    if (id === SEED_PROJECT.id) {
+      setProjects((previous) => previous.some((item) => item.id === id) ? previous : [SEED_PROJECT, ...previous]);
+    }
 
     // Route to appropriate stage depending on status
     if (proj.status === 'draft') setCurrentView('brief');
@@ -228,4 +232,9 @@ export default function App() {
       )}
     </div>
   );
+}
+
+
+export default function App() {
+  return <AuthGate><WorkspaceApp /></AuthGate>;
 }
