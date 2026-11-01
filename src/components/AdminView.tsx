@@ -98,10 +98,10 @@ export const AdminView: React.FC<AdminViewProps> = () => {
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
           <span className="text-xs text-slate-400 flex items-center gap-1.5">
             <DollarSign className="w-4 h-4 text-emerald-400" />
-            Estimated Project Cost
+            Estimated Cost (configured rates)
           </span>
           <div className="text-2xl font-black text-white font-mono">${totalCost.toFixed(4)}</div>
-          <p className="text-[10px] text-slate-500">{modelRuns.length} recorded AI runs</p>
+          <p className="text-[10px] text-slate-500">{modelRuns.length} recorded AI runs; cost depends on server rate settings</p>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
