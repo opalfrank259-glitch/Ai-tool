@@ -1,8 +1,9 @@
-import express from 'express';
+import express, { type RequestHandler } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -10,6 +11,39 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const supabasePublishableKey =
+  process.env.SUPABASE_PUBLISHABLE_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+const supabaseAuthVerifier = supabaseUrl && supabasePublishableKey
+  ? createClient(supabaseUrl, supabasePublishableKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  : null;
+
+const requireSupabaseUser: RequestHandler = async (req, res, next) => {
+  const authorization = req.headers.authorization || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!token) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+  if (!supabaseAuthVerifier) {
+    res.status(503).json({ error: 'Supabase server authentication is not configured' });
+    return;
+  }
+  try {
+    const { data, error } = await supabaseAuthVerifier.auth.getUser(token);
+    if (error || !data.user) {
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
+    }
+    (req as express.Request & { userId?: string }).userId = data.user.id;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Unable to verify session' });
+  }
+};
 
 // Determine port and host:
 // In dev mode, AI Studio dev server runs on port 3000 and host 0.0.0.0.
@@ -73,7 +107,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // AI Mentor chat endpoint with High Thinking capability
-app.post('/api/ai/mentor', async (req, res) => {
+app.post('/api/ai/mentor', requireSupabaseUser, async (req, res) => {
   const { message, projectContext, currentStep, language = 'ur-roman', enableHighThinking = false } = req.body;
 
   const systemInstruction = `You are the expert, patient AI Design Tutor of "AI Design Tutor & Creator" for Photoshop and Photopea.
@@ -151,7 +185,7 @@ Rules:
 });
 
 // AI Intake endpoint
-app.post('/api/ai/intake', async (req, res) => {
+app.post('/api/ai/intake', requireSupabaseUser, async (req, res) => {
   const { ideaText, language = 'ur-roman' } = req.body;
   if (!ideaText) {
     return res.status(400).json({ error: 'ideaText is required' });
@@ -206,7 +240,7 @@ Rules:
 });
 
 // AI Concepts endpoint
-app.post('/api/ai/concepts', async (req, res) => {
+app.post('/api/ai/concepts', requireSupabaseUser, async (req, res) => {
   const { brief, brandName = 'Your Brand' } = req.body;
 
   if (aiClient) {
