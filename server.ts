@@ -10,7 +10,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+// Determine port and host:
+// In dev mode, AI Studio dev server runs on port 3000 and host 0.0.0.0.
+// AI Studio passes --port 3000 --host 0.0.0.0 via CLI arguments.
+let port = 3000;
+let host = '0.0.0.0';
+
+const args = process.argv.slice(2);
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--port' && args[i + 1]) {
+    port = Number(args[i + 1]);
+  } else if (args[i].startsWith('--port=')) {
+    port = Number(args[i].split('=')[1]);
+  } else if (args[i] === '--host' && args[i + 1]) {
+    host = args[i + 1];
+  } else if (args[i].startsWith('--host=')) {
+    host = args[i].split('=')[1];
+  }
+}
+
+// In production only (when launched via npm start on Cloud Run without CLI flags), use process.env.PORT
+if (process.env.NODE_ENV === 'production' && !args.some(a => a.includes('port')) && process.env.PORT) {
+  port = Number(process.env.PORT);
+}
 
 app.use(express.json({ limit: '15mb' }));
 
@@ -27,10 +50,17 @@ if (apiKey) {
 
 // Model configuration
 // Note: Per user instruction:
-// For high thinking mode queries: gemini-4-argon with thinkingLevel: HIGH, no maxOutputTokens
-// For standard text/vision: gemini-3.8-flash
 const STANDARD_MODEL = 'gemini-3.8-flash';
 const THINKING_MODEL = 'gemini-4-argon';
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs = 6000): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error('AI generation timed out')), timeoutMs)
+    ),
+  ]);
+}
 
 // Health check endpoint
 app.get('/api/health', (_req, res) => {
@@ -70,11 +100,14 @@ Rules:
         config.maxOutputTokens = 800;
       }
 
-      const response = await aiClient.models.generateContent({
-        model: modelToUse,
-        contents: message,
-        config,
-      });
+      const response = await withTimeout(
+        aiClient.models.generateContent({
+          model: modelToUse,
+          contents: message,
+          config,
+        }),
+        7000
+      );
 
       const reply = response.text || 'Koi jawab nahi mil saka.';
       return res.json({
@@ -133,14 +166,17 @@ Rules:
 3. List at most 3 essential missing questions (in ${language}).
 4. Return JSON only with fields: businessName, category, targetAudience, assumptions (array), placeholders (array), missingQuestions (array of {key, question}).`;
 
-      const response = await aiClient.models.generateContent({
-        model: STANDARD_MODEL,
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          maxOutputTokens: 1000,
-        },
-      });
+      const response = await withTimeout(
+        aiClient.models.generateContent({
+          model: STANDARD_MODEL,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            maxOutputTokens: 1000,
+          },
+        }),
+        6000
+      );
 
       if (response.text) {
         const parsed = JSON.parse(response.text);
@@ -179,14 +215,17 @@ app.post('/api/ai/concepts', async (req, res) => {
 Brief: ${JSON.stringify(brief || {})}
 Return JSON array of 2 concepts with: title, oneLineIdea, mood, palette (array of 4-5 {name, hex}), typographyDirection, layoutDirection, pros (array), limitations (array).`;
 
-      const response = await aiClient.models.generateContent({
-        model: STANDARD_MODEL,
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          maxOutputTokens: 1200,
-        },
-      });
+      const response = await withTimeout(
+        aiClient.models.generateContent({
+          model: STANDARD_MODEL,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            maxOutputTokens: 1200,
+          },
+        }),
+        6000
+      );
 
       if (response.text) {
         const parsed = JSON.parse(response.text);
@@ -243,8 +282,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  app.listen(port, host, () => {
+    console.log(`Server running on http://${host}:${port}`);
   });
 }
 
