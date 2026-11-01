@@ -88,7 +88,25 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     return <main className="min-h-screen bg-slate-950 text-slate-200 grid place-items-center">Loading secure session…</main>;
   }
 
-  if (session) return <>{children}</>;
+  if (session) return (
+    <>
+      <div className="fixed right-3 top-3 z-[70] flex items-center gap-3 rounded-full border border-slate-700 bg-slate-900/95 px-3 py-2 shadow-lg">
+        <span className="hidden max-w-[180px] truncate text-xs text-slate-400 sm:inline">{session.user.email}</span>
+        <button
+          type="button"
+          onClick={async () => {
+            const { error: signOutError } = await requireSupabase().auth.signOut();
+            if (signOutError) setError(signOutError.message);
+            else setSession(null);
+          }}
+          className="rounded-full bg-slate-800 px-3 py-1.5 text-xs font-bold text-slate-200 hover:bg-slate-700"
+        >
+          Sign out
+        </button>
+      </div>
+      {children}
+    </>
+  );
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 grid place-items-center p-5">
