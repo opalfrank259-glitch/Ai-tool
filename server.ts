@@ -21,6 +21,60 @@ const supabaseAuthVerifier = supabaseUrl && supabasePublishableKey
     })
   : null;
 
+const supabaseServiceClient = supabaseUrl && process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(supabaseUrl, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  : null;
+
+type AuthenticatedRequest = express.Request & { userId?: string };
+
+async function recordAiRun(
+  req: AuthenticatedRequest,
+  details: {
+    functionName: string;
+    modelName: string;
+    usage?: any;
+    latencyMs: number;
+    status: 'ok' | 'error' | 'timeout' | 'fallback';
+    thinkingLevel?: string;
+    errorMessage?: string | null;
+    projectId?: string | null;
+  }
+): Promise<void> {
+  if (!supabaseServiceClient || !req.userId) return;
+  const inputTokens = Math.max(0, Number(details.usage?.promptTokenCount || 0));
+  const outputTokens = Math.max(0, Number(details.usage?.candidatesTokenCount || 0));
+  const inputRate = Math.max(0, Number(process.env.GEMINI_INPUT_COST_PER_1M_USD || 0));
+  const outputRate = Math.max(0, Number(process.env.GEMINI_OUTPUT_COST_PER_1M_USD || 0));
+  const hasRates = inputRate > 0 || outputRate > 0;
+  const estimatedCost = hasRates
+    ? (inputTokens * inputRate + outputTokens * outputRate) / 1_000_000
+    : 0;
+  try {
+    const { error } = await supabaseServiceClient.from('model_runs').insert({
+      user_id: req.userId,
+      project_id: details.projectId || null,
+      function_name: details.functionName,
+      model_name: details.modelName,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      thinking_level: details.thinkingLevel || null,
+      latency_ms: Math.max(0, details.latencyMs),
+      estimated_cost_usd: estimatedCost,
+      status: details.status,
+      error_message: details.errorMessage?.slice(0, 500) || null,
+      metadata: {
+        cost_estimate_status: hasRates ? 'estimated_using_server_rates' : 'rate_not_configured',
+        provider: 'google-gemini',
+      },
+    });
+    if (error) console.warn('Could not record model run:', error.message);
+  } catch (error) {
+    console.warn('Model run telemetry failed:', error);
+  }
+}
+
 const requireSupabaseUser: RequestHandler = async (req, res, next) => {
   const authorization = req.headers.authorization || '';
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
@@ -87,6 +141,11 @@ if (apiKey) {
 const STANDARD_MODEL = 'gemini-3.8-flash';
 const THINKING_MODEL = 'gemini-4-argon';
 
+function thisProjectId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs = 6000): Promise<T> {
   return Promise.race([
     promise,
@@ -108,6 +167,8 @@ app.get('/api/health', (_req, res) => {
 
 // AI Mentor chat endpoint with High Thinking capability
 app.post('/api/ai/mentor', requireSupabaseUser, async (req, res) => {
+  const requestStartedAt = Date.now();
+  const authReq = req as AuthenticatedRequest;
   const { message, projectContext, currentStep, language = 'ur-roman', enableHighThinking = false } = req.body;
 
   const systemInstruction = `You are the expert, patient AI Design Tutor of "AI Design Tutor & Creator" for Photoshop and Photopea.
@@ -144,6 +205,12 @@ Rules:
       );
 
       const reply = response.text || 'Koi jawab nahi mil saka.';
+      await recordAiRun(authReq, {
+        functionName: 'ai-mentor', modelName: modelToUse,
+        usage: (response as any).usageMetadata, latencyMs: Date.now() - requestStartedAt,
+        status: 'ok', thinkingLevel: enableHighThinking ? 'high' : 'standard',
+        projectId: thisProjectId(projectContext?.id),
+      });
       return res.json({
         ok: true,
         reply,
@@ -152,7 +219,20 @@ Rules:
       });
     } catch (error: any) {
       console.warn('Gemini API call failed, falling back to smart tutor response:', error?.message);
+      await recordAiRun(authReq, {
+        functionName: 'ai-mentor', modelName: THINKING_MODEL,
+        latencyMs: Date.now() - requestStartedAt, status: 'fallback',
+        thinkingLevel: enableHighThinking ? 'high' : 'standard', errorMessage: error?.message,
+        projectId: thisProjectId(projectContext?.id),
+      });
     }
+  } else {
+    await recordAiRun(authReq, {
+      functionName: 'ai-mentor', modelName: 'local-smart-tutor',
+      latencyMs: Date.now() - requestStartedAt, status: 'fallback',
+      thinkingLevel: enableHighThinking ? 'high' : 'standard',
+      projectId: thisProjectId(projectContext?.id),
+    });
   }
 
   // Graceful smart tutor fallback
@@ -186,6 +266,8 @@ Rules:
 
 // AI Intake endpoint
 app.post('/api/ai/intake', requireSupabaseUser, async (req, res) => {
+  const requestStartedAt = Date.now();
+  const authReq = req as AuthenticatedRequest;
   const { ideaText, language = 'ur-roman' } = req.body;
   if (!ideaText) {
     return res.status(400).json({ error: 'ideaText is required' });
@@ -214,11 +296,15 @@ Rules:
 
       if (response.text) {
         const parsed = JSON.parse(response.text);
+        await recordAiRun(authReq, { functionName: 'ai-intake', modelName: STANDARD_MODEL, usage: (response as any).usageMetadata, latencyMs: Date.now() - requestStartedAt, status: 'ok' });
         return res.json({ ok: true, data: parsed, modelUsed: STANDARD_MODEL });
       }
     } catch (e: any) {
       console.warn('Gemini intake failed, falling back:', e?.message);
+      await recordAiRun(authReq, { functionName: 'ai-intake', modelName: STANDARD_MODEL, latencyMs: Date.now() - requestStartedAt, status: 'fallback', errorMessage: e?.message });
     }
+  } else {
+    await recordAiRun(authReq, { functionName: 'ai-intake', modelName: 'local-rule-engine', latencyMs: Date.now() - requestStartedAt, status: 'fallback' });
   }
 
   // Fallback
@@ -241,6 +327,8 @@ Rules:
 
 // AI Concepts endpoint
 app.post('/api/ai/concepts', requireSupabaseUser, async (req, res) => {
+  const requestStartedAt = Date.now();
+  const authReq = req as AuthenticatedRequest;
   const { brief, brandName = 'Your Brand' } = req.body;
 
   if (aiClient) {
@@ -263,11 +351,15 @@ Return JSON array of 2 concepts with: title, oneLineIdea, mood, palette (array o
 
       if (response.text) {
         const parsed = JSON.parse(response.text);
+        await recordAiRun(authReq, { functionName: 'ai-concepts', modelName: STANDARD_MODEL, usage: (response as any).usageMetadata, latencyMs: Date.now() - requestStartedAt, status: 'ok' });
         return res.json({ ok: true, data: parsed, modelUsed: STANDARD_MODEL });
       }
     } catch (e: any) {
       console.warn('Gemini concepts failed, falling back:', e?.message);
+      await recordAiRun(authReq, { functionName: 'ai-concepts', modelName: STANDARD_MODEL, latencyMs: Date.now() - requestStartedAt, status: 'fallback', errorMessage: e?.message });
     }
+  } else {
+    await recordAiRun(authReq, { functionName: 'ai-concepts', modelName: 'local-rule-engine', latencyMs: Date.now() - requestStartedAt, status: 'fallback' });
   }
 
   return res.json({
