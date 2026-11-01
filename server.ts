@@ -156,6 +156,61 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs = 6000): Promise<T> {
 }
 
 // Health check endpoint
+const aiRequestWindows = new Map<string, number[]>();
+
+const limitAiRequests: RequestHandler = (req, res, next) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+  const now = Date.now();
+  const recent = (aiRequestWindows.get(userId) || []).filter((time) => now - time < 60_000);
+  if (recent.length >= 20) {
+    res.status(429).json({ error: 'Too many AI requests. Please wait one minute and try again.' });
+    return;
+  }
+  recent.push(now);
+  aiRequestWindows.set(userId, recent);
+  next();
+};
+
+function chargeAiCredits(amount: number, reason: string): RequestHandler {
+  return async (req, res, next) => {
+    const authorization = req.headers.authorization || '';
+    if (!supabaseUrl || !supabasePublishableKey || !authorization.startsWith('Bearer ')) {
+      res.status(503).json({ error: 'Supabase credit verification is not configured' });
+      return;
+    }
+    try {
+      const userClient = createClient(supabaseUrl, supabasePublishableKey, {
+        global: { headers: { Authorization: authorization } },
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      const requestBody = req.body || {};
+      const referenceId = thisProjectId(requestBody.projectId || requestBody.projectContext?.id);
+      const { data, error } = await userClient.rpc('spend_credits', {
+        p_amount: amount,
+        p_reason: reason,
+        p_idempotency_key: requestBody.idempotencyKey || `server:${crypto.randomUUID()}`,
+        p_reference_type: 'ai_operation',
+        p_reference_id: referenceId,
+      });
+      if (error) {
+        const insufficient = /insufficient credits/i.test(error.message || '');
+        res.status(insufficient ? 402 : 400).json({
+          error: insufficient ? 'Insufficient credits for this AI operation.' : error.message,
+        });
+        return;
+      }
+      res.setHeader('X-Remaining-Credits', String(data));
+      next();
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Credit verification failed' });
+    }
+  };
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -166,7 +221,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // AI Mentor chat endpoint with High Thinking capability
-app.post('/api/ai/mentor', requireSupabaseUser, async (req, res) => {
+app.post('/api/ai/mentor', requireSupabaseUser, limitAiRequests, async (req, res) => {
   const requestStartedAt = Date.now();
   const authReq = req as AuthenticatedRequest;
   const { message, projectContext, currentStep, language = 'ur-roman', enableHighThinking = false } = req.body;
@@ -265,7 +320,7 @@ Rules:
 });
 
 // AI Intake endpoint
-app.post('/api/ai/intake', requireSupabaseUser, async (req, res) => {
+app.post('/api/ai/intake', requireSupabaseUser, chargeAiCredits(1, 'AI intake: idea to structured brief'), async (req, res) => {
   const requestStartedAt = Date.now();
   const authReq = req as AuthenticatedRequest;
   const { ideaText, language = 'ur-roman' } = req.body;
@@ -326,7 +381,7 @@ Rules:
 });
 
 // AI Concepts endpoint
-app.post('/api/ai/concepts', requireSupabaseUser, async (req, res) => {
+app.post('/api/ai/concepts', requireSupabaseUser, chargeAiCredits(2, 'AI concepts: two design directions'), async (req, res) => {
   const requestStartedAt = Date.now();
   const authReq = req as AuthenticatedRequest;
   const { brief, brandName = 'Your Brand' } = req.body;
